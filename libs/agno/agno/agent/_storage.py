@@ -26,7 +26,7 @@ from agno.db.base import BaseDb, ComponentType, SessionType
 from agno.db.schemas.scheduler import strip_reserved_run_metadata
 from agno.db.utils import resolve_db_from_config
 from agno.exceptions import ComponentRehydrationError
-from agno.metrics import RunMetrics, SessionMetrics
+from agno.metrics import ModelMetrics, RunMetrics, SessionMetrics
 from agno.models.base import Model
 from agno.models.message import Message
 from agno.registry._reserved import RESERVED_MANAGER_IDS, _reserved_manager_id_message
@@ -635,17 +635,144 @@ def get_session_metrics_internal(agent: Agent, session: AgentSession) -> Session
     return SessionMetrics()
 
 
-def update_session_metrics(agent: Agent, session: AgentSession, run_response: RunOutput) -> None:
-    """Calculate session metrics - convert run Metrics to SessionMetrics."""
+_COUNTER_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "audio_input_tokens",
+    "audio_output_tokens",
+    "audio_total_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+
+
+def _cost_delta(current: Optional[float], previous: Optional[float]) -> Optional[float]:
+    if current is None and previous is None:
+        return None
+    return (current or 0.0) - (previous or 0.0)
+
+
+def _model_metrics_delta(current: ModelMetrics, previous: Optional[ModelMetrics]) -> ModelMetrics:
+    """Only the counters this model added since the run was last stored."""
+    if previous is None:
+        return current
+    values = {field: getattr(current, field) - getattr(previous, field) for field in _COUNTER_FIELDS}
+    return ModelMetrics(
+        id=current.id,
+        provider=current.provider,
+        cost=_cost_delta(current.cost, previous.cost),
+        **values,  # type: ignore[arg-type]
+    )
+
+
+def _metrics_delta(current: RunMetrics, previous: Optional[RunMetrics]) -> RunMetrics:
+    """Strip the usage already counted for this run before it is accumulated again.
+
+    A run is persisted at every HITL pause and tool-batch checkpoint, and its
+    metrics keep growing in place. Taking the difference against the row already
+    stored keeps the session totals equal to the run totals while paused usage
+    stays visible.
+    """
+    if previous is None:
+        return current
+
+    delta = RunMetrics(
+        cost=_cost_delta(current.cost, previous.cost),
+        **{field: getattr(current, field) - getattr(previous, field) for field in _COUNTER_FIELDS},  # type: ignore[arg-type]
+    )
+
+    if current.details:
+        previous_details: Dict[str, Dict[Any, ModelMetrics]] = {}
+        for model_type, entries in (previous.details or {}).items():
+            previous_details[model_type] = {(entry.provider, entry.id): entry for entry in entries}
+        delta.details = {}
+        for model_type, entries in current.details.items():
+            delta.details[model_type] = [
+                _model_metrics_delta(entry, previous_details.get(model_type, {}).get((entry.provider, entry.id)))
+                for entry in entries
+            ]
+
+    if current.additional_metrics:
+        delta.additional_metrics = {}
+        previous_additional = previous.additional_metrics or {}
+        for key, value in current.additional_metrics.items():
+            if isinstance(value, (int, float)) and isinstance(previous_additional.get(key), (int, float)):
+                delta.additional_metrics[key] = value - previous_additional[key]
+            else:
+                delta.additional_metrics[key] = value
+
+    return delta
+
+
+def _stored_run_metrics(agent: Agent, run_id: Optional[str]) -> Optional[RunMetrics]:
+    """Metrics of the run row this write is about to replace, if the adapter keeps runs."""
+    if agent.db is None or run_id is None or not isinstance(agent.db, BaseDb):
+        return None
+    try:
+        stored_run = agent.db.get_run(run_id)
+    except NotImplementedError:
+        return None
+    except Exception as e:
+        log_debug(f"Could not read stored metrics for run {run_id}: {str(e)}")
+        return None
+    return _run_metrics_from_stored(stored_run)
+
+
+async def _astored_run_metrics(agent: Agent, run_id: Optional[str]) -> Optional[RunMetrics]:
+    """Async variant of :func:`_stored_run_metrics` for AsyncBaseDb adapters."""
+    from agno.db.base import AsyncBaseDb
+
+    if agent.db is None or run_id is None:
+        return None
+    if not isinstance(agent.db, AsyncBaseDb):
+        return _stored_run_metrics(agent, run_id)
+    try:
+        stored_run = await agent.db.get_run(run_id)
+    except NotImplementedError:
+        return None
+    except Exception as e:
+        log_debug(f"Could not read stored metrics for run {run_id}: {str(e)}")
+        return None
+    return _run_metrics_from_stored(stored_run)
+
+
+def _run_metrics_from_stored(stored_run: Any) -> Optional[RunMetrics]:
+    stored_metrics = stored_run.get("metrics") if isinstance(stored_run, dict) else getattr(stored_run, "metrics", None)
+    if isinstance(stored_metrics, dict):
+        stored_metrics = RunMetrics.from_dict(stored_metrics)
+    return stored_metrics if isinstance(stored_metrics, RunMetrics) else None
+
+
+def _accumulate_session_metrics(
+    agent: Agent,
+    session: AgentSession,
+    run_response: RunOutput,
+    previous_metrics: Optional[RunMetrics],
+) -> None:
     session_metrics = get_session_metrics_internal(agent, session=session)
-    # Add the metrics for the current run to the session metrics
     if session_metrics is None:
         return
     if run_response.metrics is not None:
-        session_metrics.accumulate_from_run(run_response.metrics)
+        session_metrics.accumulate_from_run(_metrics_delta(run_response.metrics, previous_metrics))
 
     if session.session_data is not None:
         session.session_data["session_metrics"] = session_metrics.to_dict()
+
+
+def update_session_metrics(agent: Agent, session: AgentSession, run_response: RunOutput) -> None:
+    """Calculate session metrics - convert run Metrics to SessionMetrics."""
+    previous_metrics = _stored_run_metrics(agent, run_response.run_id) if run_response.metrics is not None else None
+    _accumulate_session_metrics(agent, session=session, run_response=run_response, previous_metrics=previous_metrics)
+
+
+async def aupdate_session_metrics(agent: Agent, session: AgentSession, run_response: RunOutput) -> None:
+    """Async variant of :func:`update_session_metrics`."""
+    previous_metrics = (
+        await _astored_run_metrics(agent, run_response.run_id) if run_response.metrics is not None else None
+    )
+    _accumulate_session_metrics(agent, session=session, run_response=run_response, previous_metrics=previous_metrics)
 
 
 def read_or_create_session(

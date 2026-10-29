@@ -737,6 +737,13 @@ def update_session_metrics(agent: Agent, session: AgentSession, run_response: Ru
     _update_session_metrics_storage(agent, session=session, run_response=run_response)
 
 
+async def aupdate_session_metrics(agent: Agent, session: AgentSession, run_response: RunOutput) -> None:
+    """Async variant of :func:`update_session_metrics`."""
+    from agno.agent._storage import aupdate_session_metrics as _aupdate_session_metrics_storage
+
+    await _aupdate_session_metrics_storage(agent, session=session, run_response=run_response)
+
+
 # ---------------------------------------------------------------------------
 # Session messages
 # ---------------------------------------------------------------------------

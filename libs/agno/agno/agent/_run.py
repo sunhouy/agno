@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 from agno.agent._init import _initialize_session_state
 from agno.agent._run_options import resolve_run_options
-from agno.agent._session import initialize_session, update_session_metrics
+from agno.agent._session import aupdate_session_metrics, initialize_session, update_session_metrics
 from agno.agent._tools import result_store_kwargs
 from agno.exceptions import (
     InputCheckError,
@@ -6079,7 +6079,7 @@ async def apersist_run_in_session(
 
     session.upsert_run(run=storage_copy)
     run_index = resolve_run_index(session, storage_copy)
-    update_session_metrics(agent, session=session, run_response=run_response)
+    await aupdate_session_metrics(agent, session=session, run_response=run_response)
 
     if run_context is not None and run_context.session_state is not None:
         if session.session_data is not None:
